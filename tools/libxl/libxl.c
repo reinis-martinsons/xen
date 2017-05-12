@@ -3720,9 +3720,6 @@ static void device_complete(libxl__egc *egc, libxl__ao_device *aodev)
                libxl__device_action_to_string(aodev->action),
                aodev->rc ? "failed" : "succeed");
 
-    if (aodev->action == LIBXL__DEVICE_ACTION_REMOVE)
-        free(aodev->dev);
-
     libxl__nested_ao_free(aodev->ao);
 }
 
@@ -3762,7 +3759,12 @@ static int add_device(libxl__egc *egc, libxl__ao *ao,
 
         GCNEW(aodev);
         libxl__prepare_ao_device(ao, aodev);
-        aodev->dev = dev;
+        /*
+         * Clone the libxl__device to avoid races if remove_device is called
+         * before the device addition has finished.
+         */
+        GCNEW(aodev->dev);
+        *aodev->dev = *dev;
         aodev->action = LIBXL__DEVICE_ACTION_ADD;
         aodev->callback = device_complete;
         libxl__wait_device_connection(egc, aodev);
@@ -3805,7 +3807,12 @@ static int remove_device(libxl__egc *egc, libxl__ao *ao,
 
         GCNEW(aodev);
         libxl__prepare_ao_device(ao, aodev);
-        aodev->dev = dev;
+        /*
+         * Clone the libxl__device to avoid races if there's a add_device
+         * running in parallel.
+         */
+        GCNEW(aodev->dev);
+        *aodev->dev = *dev;
         aodev->action = LIBXL__DEVICE_ACTION_REMOVE;
         aodev->callback = device_complete;
         libxl__initiate_device_generic_remove(egc, aodev);
@@ -3817,7 +3824,6 @@ static int remove_device(libxl__egc *egc, libxl__ao *ao,
                 goto out;
         }
         libxl__device_destroy(gc, dev);
-        free(dev);
         /* Fall through to return > 0, no ao has been dispatched */
     default:
         rc = 1;
@@ -3837,8 +3843,8 @@ static void backend_watch_callback(libxl__egc *egc, libxl__ev_xswatch *watch,
     STATE_AO_GC(nested_ao);
     char *p, *path;
     const char *sstate, *sonline;
-    int state, online, rc, num_devs;
-    libxl__device *dev = NULL;
+    int state, online, rc;
+    libxl__device *dev;
     libxl__ddomain_device *ddev = NULL;
     libxl__ddomain_guest *dguest = NULL;
     bool free_ao = false;
@@ -3866,7 +3872,7 @@ static void backend_watch_callback(libxl__egc *egc, libxl__ev_xswatch *watch,
         goto skip;
     online = atoi(sonline);
 
-    dev = libxl__zalloc(NOGC, sizeof(*dev));
+    GCNEW(dev);
     rc = libxl__parse_backend_path(gc, path, dev);
     if (rc)
         goto skip;
@@ -3902,6 +3908,8 @@ static void backend_watch_callback(libxl__egc *egc, libxl__ev_xswatch *watch,
          */
         ddev = libxl__zalloc(NOGC, sizeof(*ddev));
         ddev->dev = dev;
+        ddev->dev = libxl__zalloc(NOGC, sizeof(*ddev->dev));
+        *ddev->dev = *dev;
         LIBXL_SLIST_INSERT_HEAD(&dguest->devices, ddev, next);
         LOG(DEBUG, "added device %s to the list of active devices", path);
         rc = add_device(egc, nested_ao, dguest, ddev);
@@ -3911,30 +3919,15 @@ static void backend_watch_callback(libxl__egc *egc, libxl__ev_xswatch *watch,
         /*
          * Removal of an active device, remove it from the list and
          * free it's data structures if they are no longer needed.
-         *
-         * The free of the associated libxl__device is left to the
-         * helper remove_device function.
          */
         LIBXL_SLIST_REMOVE(&dguest->devices, ddev, libxl__ddomain_device,
                            next);
         LOG(DEBUG, "removed device %s from the list of active devices", path);
         rc = remove_device(egc, nested_ao, dguest, ddev);
         if (rc > 0)
-            free_ao = true;
+            libxl__nested_ao_free(nested_ao);
 
-        free(ddev);
-        /* If this was the last device in the domain, remove it from the list */
-        num_devs = dguest->num_vifs + dguest->num_vbds + dguest->num_qdisks;
-        if (num_devs == 0) {
-            LIBXL_SLIST_REMOVE(&ddomain->guests, dguest, libxl__ddomain_guest,
-                               next);
-            LOG(DEBUG, "removed domain %u from the list of active guests",
-                       dguest->domid);
-            /* Clear any leftovers in libxl/<domid> */
-            libxl__xs_rm_checked(gc, XBT_NULL,
-                                 GCSPRINTF("libxl/%u", dguest->domid));
-            free(dguest);
-        }
+        goto clean;
     }
 
     if (free_ao)
@@ -3944,9 +3937,21 @@ static void backend_watch_callback(libxl__egc *egc, libxl__ev_xswatch *watch,
 
 skip:
     libxl__nested_ao_free(nested_ao);
-    free(dev);
+clean:
+    if (ddev)
+        free(ddev->dev);
     free(ddev);
-    free(dguest);
+    if (dguest != NULL &&
+        dguest->num_vifs + dguest->num_vbds + dguest->num_qdisks == 0) {
+        LIBXL_SLIST_REMOVE(&ddomain->guests, dguest, libxl__ddomain_guest,
+                           next);
+        LOG(DEBUG, "removed domain %u from the list of active guests",
+                   dguest->domid);
+        /* Clear any leftovers in libxl/<domid> */
+        libxl__xs_rm_checked(gc, XBT_NULL,
+                             GCSPRINTF("libxl/%u", dguest->domid));
+        free(dguest);
+    }
     return;
 }
 
